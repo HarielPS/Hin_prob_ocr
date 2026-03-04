@@ -1,434 +1,100 @@
-Va, lo aterrizo y te dejo ya el esqueleto funcional para tu OCR + contexto (Tesseract + pdf2image), listo para enchufarlo al pipeline. También aclaro lo del “modelo”.
+# app/api/routes_rules.py
 
-
----
-
-1) ¿Qué significa “crear el modelo” si usarás GPT-nano?
-
-En LangChain, “crear el modelo” = instanciar el cliente ChatOpenAI(...) con tu API key, modelo (ej. "gpt-4.1-nano" o el que pongas en .env) y parámetros (temperature, max_tokens).
-
-No descarga nada.
-
-No entrena nada.
-
-Solo crea el wrapper/cliente que luego usas con chain.invoke(...).
-
-
-En local (sin FastAPI) lo creas con create_chat_model() cuando llamas el pipeline.
-En FastAPI lo creas 1 vez en startup y lo reutilizas.
-
-Eso es todo.
-
-
----
-
-2) Ahora sí: OCR + Contexto (Tesseract + pdf2image)
-
-Lo que describes es una función “grande” que debe devolver:
-
-region_text: OCR del bbox
-
-context_text: OCR de contexto (media hoja anterior/siguiente según caso)
-
-table_header_text: si detecta tabla multihoja, buscar encabezados y pegarlos
-
-text_for_llm: lo que finalmente mandas al LLM
-
-debug prints
-
-
-Vamos a hacerlo en 2 archivos para que quede limpio:
-
-A) app/ocr/ocr_service.py  (OCR “puro”)
-
-renderiza página a imagen
-
-recorta bbox
-
-OCR con tesseract
-
-OCR de franja (top/bottom half)
-
-
-B) app/ocr/context_builder.py (tu “función grande”)
-
-decide si agrega anterior/siguiente
-
-heurística de tabla (MVP)
-
-busca encabezados en páginas previas
-
-construye text_for_llm
-
-
-
----
-
-3) Implementación: app/ocr/ocr_service.py
-
-Crea este archivo:
-
-# app/ocr/ocr_service.py
-
-from __future__ import annotations
-from dataclasses import dataclass
+import json
+import os
+import tempfile
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Optional, Any, Dict
 
-import pytesseract
-from PIL import Image, ImageOps
-from pdf2image import convert_from_path
+from fastapi import APIRouter, UploadFile, File, Form, Depends, Request, HTTPException
+from langchain_core.language_models.chat_models import BaseChatModel
 
+from app.llm.providers import get_chat_model
+from app.pipelines.rules_pipeline import generate_rule_pipeline
 
-@dataclass
-class OCRResult:
-    text: str
-    mean_conf: Optional[float] = None
+router = APIRouter()
 
-
-def render_pdf_page(pdf_path: str, page_index: int, dpi: int = 220) -> Image.Image:
-    pages = convert_from_path(
-        pdf_path,
-        dpi=dpi,
-        first_page=page_index + 1,
-        last_page=page_index + 1,
-    )
-    if not pages:
-        raise ValueError("No se pudo renderizar la página del PDF.")
-    return pages[0].convert("RGB")
+SUPPORTED_EXT = {".pdf", ".png", ".jpg", ".jpeg"}  # doc/docx después (convertir a pdf)
+CHUNK_SIZE = 1024 * 1024  # 1MB
 
 
-def load_image(file_path: str) -> Image.Image:
-    return Image.open(file_path).convert("RGB")
+def _safe_suffix(filename: Optional[str]) -> str:
+    if not filename:
+        return ""
+    return Path(filename).suffix.lower()
 
 
-def load_page_image(file_path: str, page_index: int, dpi: int = 220) -> Image.Image:
-    p = Path(file_path)
-    ext = p.suffix.lower()
-    if ext == ".pdf":
-        return render_pdf_page(str(p), page_index, dpi=dpi)
-    if ext in {".png", ".jpg", ".jpeg"}:
-        return load_image(str(p))
-    raise ValueError(f"Formato no soportado para OCR: {ext}")
+def _save_upload_to_temp_streaming(upload: UploadFile) -> str:
+    """
+    Guarda UploadFile a un temp file sin cargarlo completo en RAM (streaming).
+    """
+    suffix = _safe_suffix(upload.filename)
+    if suffix and suffix not in SUPPORTED_EXT:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Formato no soportado: {suffix}. Soportados: {sorted(SUPPORTED_EXT)}",
+        )
 
+    # Crear temp file con extensión (para que OCR sepa qué es)
+    fd, tmp_path = tempfile.mkstemp(suffix=suffix)
+    os.close(fd)
 
-def crop_bbox(img: Image.Image, bbox: Dict[str, int]) -> Image.Image:
-    return img.crop((bbox["x1"], bbox["y1"], bbox["x2"], bbox["y2"]))
-
-
-def crop_top_half(img: Image.Image) -> Image.Image:
-    w, h = img.size
-    return img.crop((0, 0, w, h // 2))
-
-
-def crop_bottom_half(img: Image.Image) -> Image.Image:
-    w, h = img.size
-    return img.crop((0, h // 2, w, h))
-
-
-def preprocess(img: Image.Image) -> Image.Image:
-    # MVP: gris + autocontrast
-    g = ImageOps.grayscale(img)
-    g = ImageOps.autocontrast(g)
-    return g
-
-
-def ocr_tesseract(img: Image.Image, lang: str = "spa") -> OCRResult:
-    proc = preprocess(img)
-    data = pytesseract.image_to_data(proc, lang=lang, output_type=pytesseract.Output.DICT)
-
-    words = []
-    confs = []
-    n = len(data.get("text", []))
-
-    for i in range(n):
-        txt = (data["text"][i] or "").strip()
+    try:
+        with open(tmp_path, "wb") as out:
+            while True:
+                chunk = upload.file.read(CHUNK_SIZE)
+                if not chunk:
+                    break
+                out.write(chunk)
+        return tmp_path
+    except Exception as e:
+        # Si falla, intenta limpiar
         try:
-            conf = float(data["conf"][i])
-        except Exception:
-            conf = -1.0
-
-        if txt:
-            words.append(txt)
-        if conf >= 0:
-            confs.append(conf)
-
-    text = " ".join(words).strip()
-    mean_conf = (sum(confs) / len(confs)) if confs else None
-    return OCRResult(text=text, mean_conf=mean_conf)
-
-Instala deps si faltan:
-
-sudo apt-get install -y tesseract-ocr tesseract-ocr-spa poppler-utils
-pip install pytesseract pdf2image pillow
-
-
----
-
-4) Implementación: app/ocr/context_builder.py (tu función grande)
-
-Crea este archivo:
-
-# app/ocr/context_builder.py
-
-from __future__ import annotations
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Dict, List, Optional
-
-from app.ocr.ocr_service import (
-    load_page_image,
-    crop_bbox,
-    crop_top_half,
-    crop_bottom_half,
-    ocr_tesseract,
-    OCRResult,
-)
-
-
-@dataclass
-class ContextOCR:
-    region_text: str
-    region_conf: Optional[float]
-    context_text: str
-    context_conf: Optional[float]
-    headers_text: str
-    headers_conf: Optional[float]
-    text_for_llm: str
-    pages_used: List[int]
-    debug: Dict[str, Any]
-
-
-def _is_near_top(bbox: Dict[str, int], img_h: int, threshold: float = 0.15) -> bool:
-    return bbox["y1"] <= int(img_h * threshold)
-
-
-def _is_near_bottom(bbox: Dict[str, int], img_h: int, threshold: float = 0.85) -> bool:
-    return bbox["y2"] >= int(img_h * threshold)
-
-
-def _looks_like_table(region_text: str) -> bool:
-    """
-    Heurística MVP:
-    - muchas líneas
-    - presencia de múltiples separadores/valores por línea
-    - o números repetidos y tokens cortos
-    """
-    lines = [ln.strip() for ln in region_text.splitlines() if ln.strip()]
-    if len(lines) >= 4:
-        # si varias líneas tienen 2+ "columnas" (separadas por múltiples espacios)
-        col_like = sum(1 for ln in lines if "  " in ln or "\t" in ln)
-        if col_like >= max(2, len(lines) // 2):
-            return True
-    return False
-
-
-def _find_headers_in_text(page_text: str) -> str:
-    """
-    MVP simple: toma las primeras N líneas “densas” como headers candidatos.
-    Luego lo mejoramos con detección de tabla.
-    """
-    lines = [ln.strip() for ln in page_text.splitlines() if ln.strip()]
-    return "\n".join(lines[:12])
-
-
-def build_context_for_llm(
-    file_path: str,
-    page_index: int,
-    bbox: Dict[str, int],
-    dpi: int = 220,
-    lang: str = "spa",
-    max_header_pages_back: int = 3,
-) -> ContextOCR:
-    """
-    1) OCR bbox (region)
-    2) OCR contexto (media página anterior/siguiente si bbox near top/bottom)
-    3) Si parece tabla: buscar headers hacia atrás (hasta N páginas) y pegarlos
-    4) Construir text_for_llm
-    5) Debug print (lo que mandas)
-    """
-    # Page image (selected)
-    page_img = load_page_image(file_path, page_index, dpi=dpi)
-    w, h = page_img.size
-
-    # 1) region OCR
-    region_img = crop_bbox(page_img, bbox)
-    region_res = ocr_tesseract(region_img, lang=lang)
-
-    # 2) context OCR (prev/next half)
-    context_chunks: List[str] = []
-    context_confs: List[float] = []
-    pages_used = [page_index]
-
-    near_top = _is_near_top(bbox, h)
-    near_bottom = _is_near_bottom(bbox, h)
-
-    # Si está cerca del top, intenta traer bottom half de página anterior
-    if near_top and page_index > 0 and Path(file_path).suffix.lower() == ".pdf":
-        prev_img = load_page_image(file_path, page_index - 1, dpi=dpi)
-        prev_bottom = crop_bottom_half(prev_img)
-        prev_res = ocr_tesseract(prev_bottom, lang=lang)
-        context_chunks.append("[CTX_PREV_BOTTOM]\n" + prev_res.text)
-        if prev_res.mean_conf is not None:
-            context_confs.append(prev_res.mean_conf)
-        pages_used.append(page_index - 1)
-
-    # Si está cerca del bottom, intenta traer top half de página siguiente
-    if near_bottom and Path(file_path).suffix.lower() == ".pdf":
-        # ojo: no sabemos total páginas aquí (pdf2image parcial), MVP: intenta y atrapa error
-        try:
-            next_img = load_page_image(file_path, page_index + 1, dpi=dpi)
-            next_top = crop_top_half(next_img)
-            next_res = ocr_tesseract(next_top, lang=lang)
-            context_chunks.append("[CTX_NEXT_TOP]\n" + next_res.text)
-            if next_res.mean_conf is not None:
-                context_confs.append(next_res.mean_conf)
-            pages_used.append(page_index + 1)
+            Path(tmp_path).unlink(missing_ok=True)
         except Exception:
             pass
-
-    context_text = "\n\n".join([c for c in context_chunks if c.strip()])
-    context_conf = (sum(context_confs) / len(context_confs)) if context_confs else None
-
-    # 3) headers/table logic
-    headers_text = ""
-    headers_conf = None
-    looks_table = _looks_like_table(region_res.text)
-
-    if looks_table and Path(file_path).suffix.lower() == ".pdf":
-        # Busca headers hacia atrás (MVP: OCR page completa y tomar primeras líneas)
-        best_headers = ""
-        best_conf = -1.0
-        used_pages = []
-
-        for back in range(0, max_header_pages_back + 1):
-            idx = page_index - back
-            if idx < 0:
-                break
-            img = load_page_image(file_path, idx, dpi=dpi)
-            full_res = ocr_tesseract(img, lang=lang)
-            cand = _find_headers_in_text(full_res.text)
-            conf = full_res.mean_conf or 0.0
-
-            # Heurística: si hay “más letras” en primeras líneas, puede ser encabezado
-            score = conf + (0.1 * len(cand))
-            if score > best_conf:
-                best_conf = score
-                best_headers = cand
-                headers_conf = full_res.mean_conf
-                used_pages = [idx]
-
-        headers_text = best_headers
-        pages_used += used_pages
-
-    # 4) construir text_for_llm
-    parts = []
-    parts.append("=== REGION_OCR ===\n" + (region_res.text or ""))
-    if headers_text.strip():
-        parts.append("=== TABLE_HEADERS (FOUND) ===\n" + headers_text)
-    if context_text.strip():
-        parts.append("=== CONTEXT ===\n" + context_text)
-
-    text_for_llm = "\n\n".join(parts).strip()
-
-    debug = {
-        "near_top": near_top,
-        "near_bottom": near_bottom,
-        "looks_table": looks_table,
-        "bbox": bbox,
-    }
-
-    return ContextOCR(
-        region_text=region_res.text,
-        region_conf=region_res.mean_conf,
-        context_text=context_text,
-        context_conf=context_conf,
-        headers_text=headers_text,
-        headers_conf=headers_conf,
-        text_for_llm=text_for_llm,
-        pages_used=sorted(list(set(pages_used))),
-        debug=debug,
-    )
-
-✅ Esto ya hace lo que pediste en MVP:
-
-OCR de región
-
-OCR de contexto prev/next half cuando aplica
-
-“tabla” heurística y búsqueda simple de encabezados hacia atrás
-
-arma text_for_llm
-
-incluye debug
+        raise HTTPException(status_code=500, detail=f"Error guardando archivo temporal: {e}")
 
 
+@router.post("/rules/generate")
+async def rules_generate(
+    request: Request,
+    file: UploadFile = File(...),
+    region: str = Form(...),
+    field_title: Optional[str] = Form(""),
+    model: BaseChatModel = Depends(get_chat_model),
+):
+    """
+    Genera una regla:
+    input: file + region(JSON string) + field_title
+    output: {rule, region_payload, ocr{...}}
+    """
+    # 1) Parse region JSON string
+    try:
+        region_payload: Dict[str, Any] = json.loads(region)
+    except Exception:
+        raise HTTPException(status_code=400, detail="region debe ser JSON válido (string).")
 
----
+    # Validaciones mínimas de region para evitar errores raros
+    if "page_index" not in region_payload or "bbox" not in region_payload:
+        raise HTTPException(status_code=400, detail="region debe incluir page_index y bbox.")
 
-5) Conectar esto al pipeline (generate_rule_pipeline)
+    # 2) Guardar archivo grande a temp por streaming
+    tmp_path = _save_upload_to_temp_streaming(file)
 
-En app/pipelines/rules_pipeline.py cambia el OCR stub por:
+    try:
+        # 3) Pipeline completo (OCR + contexto + LLM)
+        resp = generate_rule_pipeline(
+            file_path=tmp_path,
+            region_payload=region_payload,
+            field_title=field_title or "",
+            model=model,  # inyectado por FastAPI
+        )
+        return resp
 
-from app.ocr.context_builder import build_context_for_llm
-
-ctx = build_context_for_llm(
-    file_path=file_path,
-    page_index=region_payload["page_index"],
-    bbox=region_payload["bbox"],
-    dpi=220,
-    lang="spa",
-)
-
-# Debug: imprime región y contexto que se mandará al LLM
-print("\n--- OCR DEBUG ---")
-print("REGION_TEXT:\n", ctx.region_text[:800])
-print("\nCONTEXT_TEXT:\n", ctx.context_text[:800])
-print("\nHEADERS_TEXT:\n", ctx.headers_text[:800])
-print("\nTEXT_FOR_LLM:\n", ctx.text_for_llm[:1200])
-print("--- END OCR DEBUG ---\n")
-
-final_ocr_text = ctx.text_for_llm
-
-Y en el return de la pipeline, mete info:
-
-"ocr": {
-  "text": final_ocr_text,
-  "mean_conf": ctx.region_conf,
-  "context_conf": ctx.context_conf,
-  "headers_conf": ctx.headers_conf,
-  "strategy_used": "auto_context",
-  "pages_used": ctx.pages_used,
-  "debug": ctx.debug
-}
-
-
----
-
-6) Sobre DOC/DOCX
-
-Con Tesseract+pdf2image, DOC/DOCX no se puede renderizar directo. Para MVP lo mejor es:
-
-“Solo PDF + imágenes” en el selector
-
-y luego agregamos conversión DOCX→PDF con LibreOffice headless cuando toque.
-
-
-
----
-
-7) Pregunta rápida (sin frenar el avance)
-
-Tus PDFs son mayormente:
-
-escaneados (imagen) ✅ (Tesseract aplica)
-
-o digitales (texto seleccionable) (ahí conviene extraer texto sin OCR)
-
-
-No hace falta que respondas para seguir; lo anterior ya funciona en escaneados.
-
-
----
-
-Si quieres, en el siguiente mensaje te paso el generate_rule_pipeline.py completo ya con build_context_for_llm() integrado y el print de debug exactamente como lo pediste.
+    finally:
+        # Limpieza del temp (en prod sí; para debug puedes comentar)
+        try:
+            Path(tmp_path).unlink(missing_ok=True)
+        except Exception:
+            pass
