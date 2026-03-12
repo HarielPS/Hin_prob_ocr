@@ -1,595 +1,328 @@
-Te lo dejo ya aterrizado a tu caso exacto: una API que maneja
-
-crear sesión
-
-eliminar sesión
-
-subir documento
-
-recuperar documento
-
-borrar documento en disco
-
-
-con una carpeta temp/ y una sesión ligera en memoria.
-
-La idea es esta:
-
-la sesión guarda metadatos
-
-el documento vive en temp/{session_id}/
-
-recover_document toma el original desde disco
-
-si necesitas un rango de páginas, crea un chunk temporal
-
-al eliminar la sesión, borras memoria y carpeta temporal
-
-
-
----
-
-Estructura recomendada
-
-app/
-├── main.py
-├── models/
-│   └── session_models.py
-├── services/
-│   ├── session_manager.py
-│   ├── storage_service.py
-│   └── document_service.py
-└── temp/
-
-
----
-
-1) app/models/session_models.py
-
-Aquí defines la estructura de la sesión y de recuperación.
-
-from datetime import datetime
-from typing import Optional
-from pydantic import BaseModel, Field
-
-
-class SessionData(BaseModel):
-    session_id: str
-    filename: str
-    content_type: str
-    file_path: str
-    session_dir: str
-    created_at: datetime
-    expires_at: datetime
-    page_count: Optional[int] = None
-    chunks: list[str] = Field(default_factory=list)
-
-
-class RecoveredDocument(BaseModel):
-    source_file_path: str
-    recovered_file_path: str
-    start_page: Optional[int] = None
-    end_page: Optional[int] = None
-    is_original: bool = False
-
-
----
-
-2) app/services/session_manager.py
-
-Esto solo maneja la sesión en memoria.
-
-from datetime import datetime, timedelta, timezone
-from uuid import uuid4
-from typing import Dict
-from fastapi import HTTPException
-
-from app.models.session_models import SessionData
-
-
-class SessionManager:
-    def __init__(self, ttl_minutes: int = 120):
-        self.ttl_minutes = ttl_minutes
-        self.sessions: Dict[str, SessionData] = {}
-
-    def create_session(
-        self,
-        filename: str,
-        content_type: str,
-        file_path: str,
-        session_dir: str,
-        page_count: int | None = None,
-    ) -> SessionData:
-        session_id = str(uuid4())
-        now = datetime.now(timezone.utc)
-        expires_at = now + timedelta(minutes=self.ttl_minutes)
-
-        session = SessionData(
-            session_id=session_id,
-            filename=filename,
-            content_type=content_type,
-            file_path=file_path,
-            session_dir=session_dir,
-            created_at=now,
-            expires_at=expires_at,
-            page_count=page_count,
-        )
-
-        self.sessions[session_id] = session
-        return session
-
-    def create_session_with_id(
-        self,
-        session_id: str,
-        filename: str,
-        content_type: str,
-        file_path: str,
-        session_dir: str,
-        page_count: int | None = None,
-    ) -> SessionData:
-        now = datetime.now(timezone.utc)
-        expires_at = now + timedelta(minutes=self.ttl_minutes)
-
-        session = SessionData(
-            session_id=session_id,
-            filename=filename,
-            content_type=content_type,
-            file_path=file_path,
-            session_dir=session_dir,
-            created_at=now,
-            expires_at=expires_at,
-            page_count=page_count,
-        )
-
-        self.sessions[session_id] = session
-        return session
-
-    def get_session(self, session_id: str) -> SessionData:
-        session = self.sessions.get(session_id)
-
-        if session is None:
-            raise HTTPException(status_code=404, detail="Session not found")
-
-        if datetime.now(timezone.utc) > session.expires_at:
-            self.sessions.pop(session_id, None)
-            raise HTTPException(status_code=410, detail="Session expired")
-
-        return session
-
-    def delete_session(self, session_id: str) -> None:
-        self.sessions.pop(session_id, None)
-
-
----
-
-3) app/services/storage_service.py
-
-Este servicio maneja el disco.
-
-import shutil
+import json
 from pathlib import Path
-from uuid import uuid4
-from fastapi import UploadFile, HTTPException
+from datetime import datetime, timezone
 
-
-class StorageService:
-    def __init__(self, temp_dir: str = "app/temp"):
-        self.temp_dir = Path(temp_dir)
-        self.temp_dir.mkdir(parents=True, exist_ok=True)
-
-    def create_session_dir(self, session_id: str) -> Path:
-        session_dir = self.temp_dir / session_id
-        session_dir.mkdir(parents=True, exist_ok=True)
-        return session_dir
-
-    def save_uploaded_file(self, session_id: str, upload_file: UploadFile) -> tuple[str, str]:
-        session_dir = self.create_session_dir(session_id)
-        file_path = session_dir / upload_file.filename
-
-        with file_path.open("wb") as buffer:
-            shutil.copyfileobj(upload_file.file, buffer)
-
-        return str(file_path), str(session_dir)
-
-    def delete_session_dir(self, session_id: str) -> None:
-        session_dir = self.temp_dir / session_id
-        if session_dir.exists():
-            shutil.rmtree(session_dir, ignore_errors=True)
-
-    def ensure_chunks_dir(self, session_id: str) -> Path:
-        chunks_dir = self.temp_dir / session_id / "chunks"
-        chunks_dir.mkdir(parents=True, exist_ok=True)
-        return chunks_dir
-
-    def build_chunk_path(self, session_id: str, start_page: int, end_page: int) -> Path:
-        chunks_dir = self.ensure_chunks_dir(session_id)
-        return chunks_dir / f"pages_{start_page}_{end_page}.pdf"
-
-    def delete_file(self, file_path: str) -> None:
-        path = Path(file_path)
-        if path.exists() and path.is_file():
-            path.unlink()
-
-    def validate_file_exists(self, file_path: str) -> Path:
-        path = Path(file_path)
-        if not path.exists():
-            raise HTTPException(status_code=404, detail="Document file not found on disk")
-        return path
-
-
----
-
-4) app/services/document_service.py
-
-Aquí está la lógica de documento: subir, recuperar original o rango, y borrar.
-
-Voy a usar pypdf para extraer páginas. Si no la tienes, sería:
-
-pip install pypdf
-
-from pathlib import Path
-from fastapi import UploadFile, HTTPException
-from pypdf import PdfReader, PdfWriter
-
-from app.models.session_models import RecoveredDocument
-from app.services.storage_service import StorageService
+from app.models.ocr_models import OCRDocumentCache, OCRPageCache
 from app.services.session_manager import SessionManager
 
 
-class DocumentService:
-    def __init__(self, storage_service: StorageService, session_manager: SessionManager):
-        self.storage_service = storage_service
+class OCRCacheService:
+    def __init__(self, session_manager: SessionManager):
         self.session_manager = session_manager
 
-    def upload_document(self, upload_file: UploadFile):
-        if not upload_file.filename:
-            raise HTTPException(status_code=400, detail="Filename is required")
+    def _get_cache_file_path(self, session_id: str) -> Path:
+        session = self.session_manager.get_session(session_id)
+        return Path(session.session_dir) / "ocr_cache.json"
 
-        allowed_types = {
-            "application/pdf",
-            "image/png",
-            "image/jpeg",
-            "image/jpg",
+    def persist_session_cache_to_disk(self, session_id: str) -> None:
+        session = self.session_manager.get_session(session_id)
+        cache_path = self._get_cache_file_path(session_id)
+
+        serializable = {
+            "document_path": session.ocr_cache.document_path,
+            "filename": session.ocr_cache.filename,
+            "page_count": session.ocr_cache.page_count,
+            "pages": {
+                str(page): {
+                    "page_number": page_cache.page_number,
+                    "text": page_cache.text,
+                    "cached_at": page_cache.cached_at.isoformat(),
+                    "source_path": page_cache.source_path,
+                }
+                for page, page_cache in session.ocr_cache.pages.items()
+            }
         }
 
-        if upload_file.content_type not in allowed_types:
-            raise HTTPException(status_code=400, detail="Unsupported file type")
+        with cache_path.open("w", encoding="utf-8") as f:
+            json.dump(serializable, f, ensure_ascii=False, indent=2)
 
-        from uuid import uuid4
-        session_id = str(uuid4())
+    def hydrate_session_cache_from_disk_if_needed(self, session_id: str) -> OCRDocumentCache:
+        session = self.session_manager.get_session(session_id)
 
-        file_path, session_dir = self.storage_service.save_uploaded_file(session_id, upload_file)
+        if session.ocr_cache.pages:
+            return session.ocr_cache
 
-        page_count = None
-        if upload_file.content_type == "application/pdf":
-            page_count = self._count_pdf_pages(file_path)
-        elif upload_file.content_type.startswith("image/"):
-            page_count = 1
+        cache_path = self._get_cache_file_path(session_id)
+        if not cache_path.exists():
+            return session.ocr_cache
 
-        session = self.session_manager.create_session_with_id(
-            session_id=session_id,
-            filename=upload_file.filename,
-            content_type=upload_file.content_type,
-            file_path=file_path,
-            session_dir=session_dir,
-            page_count=page_count,
+        with cache_path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        pages_data = {
+            int(page): OCRPageCache(
+                page_number=page_data["page_number"],
+                text=page_data["text"],
+                cached_at=datetime.fromisoformat(page_data["cached_at"]),
+                source_path=page_data.get("source_path"),
+            )
+            for page, page_data in data.get("pages", {}).items()
+        }
+
+        session.ocr_cache = OCRDocumentCache(
+            document_path=data["document_path"],
+            filename=data["filename"],
+            page_count=data.get("page_count"),
+            pages=pages_data,
         )
 
-        return session
+        return session.ocr_cache
 
-    def recover_document(
+    def get_missing_pages(
         self,
         session_id: str,
-        start_page: int | None = None,
-        end_page: int | None = None,
-    ) -> RecoveredDocument:
-        session = self.session_manager.get_session(session_id)
-        original_path = self.storage_service.validate_file_exists(session.file_path)
-
-        # Si es imagen, solo regresa el original
-        if session.content_type.startswith("image/"):
-            return RecoveredDocument(
-                source_file_path=str(original_path),
-                recovered_file_path=str(original_path),
-                is_original=True,
-            )
-
-        # Si es PDF y no mandan rango, regresa el original
-        if start_page is None and end_page is None:
-            return RecoveredDocument(
-                source_file_path=str(original_path),
-                recovered_file_path=str(original_path),
-                is_original=True,
-            )
-
-        if start_page is None or end_page is None:
-            raise HTTPException(status_code=400, detail="start_page and end_page must both be provided")
-
-        if start_page < 1 or end_page < 1:
-            raise HTTPException(status_code=400, detail="Pages must be >= 1")
-
-        if start_page > end_page:
-            raise HTTPException(status_code=400, detail="start_page cannot be greater than end_page")
-
-        if session.page_count is not None and end_page > session.page_count:
-            raise HTTPException(status_code=400, detail="Requested range exceeds document page count")
-
-        chunk_path = self.storage_service.build_chunk_path(session_id, start_page, end_page)
-
-        # Si ya existe el chunk, lo reutilizamos
-        if chunk_path.exists():
-            return RecoveredDocument(
-                source_file_path=str(original_path),
-                recovered_file_path=str(chunk_path),
-                start_page=start_page,
-                end_page=end_page,
-                is_original=False,
-            )
-
-        self._extract_pdf_range(
-            source_pdf_path=str(original_path),
-            output_pdf_path=str(chunk_path),
-            start_page=start_page,
-            end_page=end_page,
-        )
-
-        session.chunks.append(str(chunk_path))
-
-        return RecoveredDocument(
-            source_file_path=str(original_path),
-            recovered_file_path=str(chunk_path),
-            start_page=start_page,
-            end_page=end_page,
-            is_original=False,
-        )
-
-    def delete_document_from_disk(self, session_id: str) -> None:
-        session = self.session_manager.get_session(session_id)
-        self.storage_service.delete_session_dir(session_id)
-        self.session_manager.delete_session(session_id)
-
-    def _count_pdf_pages(self, file_path: str) -> int:
-        reader = PdfReader(file_path)
-        return len(reader.pages)
-
-    def _extract_pdf_range(
-        self,
-        source_pdf_path: str,
-        output_pdf_path: str,
         start_page: int,
         end_page: int,
-    ) -> None:
-        reader = PdfReader(source_pdf_path)
-        writer = PdfWriter()
+    ) -> list[int]:
+        cache = self.hydrate_session_cache_from_disk_if_needed(session_id)
+        requested_pages = list(range(start_page, end_page + 1))
+        return [page for page in requested_pages if page not in cache.pages]
 
-        # pypdf usa índice base 0
-        for page_index in range(start_page - 1, end_page):
-            writer.add_page(reader.pages[page_index])
+    def add_page_result(
+        self,
+        session_id: str,
+        page_number: int,
+        text: str,
+        source_path: str | None = None,
+    ) -> OCRDocumentCache:
+        session = self.session_manager.get_session(session_id)
 
-        with open(output_pdf_path, "wb") as output_file:
-            writer.write(output_file)
+        session.ocr_cache.pages[page_number] = OCRPageCache(
+            page_number=page_number,
+            text=text,
+            cached_at=datetime.now(timezone.utc),
+            source_path=source_path,
+        )
 
+        self.persist_session_cache_to_disk(session_id)
+        return session.ocr_cache
 
----
+    def build_text_for_range(
+        self,
+        session_id: str,
+        start_page: int,
+        end_page: int,
+    ) -> str:
+        cache = self.hydrate_session_cache_from_disk_if_needed(session_id)
 
-5) Cómo se usan estas funciones
+        parts = []
+        for page in range(start_page, end_page + 1):
+            if page in cache.pages:
+                parts.append(cache.pages[page].text)
 
-Crear sesión + subir documento
-
-En realidad en tu flujo se crean juntas cuando subes el archivo.
-
-session = document_service.upload_document(upload_file)
-
-Eso hace:
-
-1. genera session_id
-
-
-2. crea carpeta temp/{session_id}
-
-
-3. guarda archivo
-
-
-4. crea sesión en memoria
-
-
-5. devuelve SessionData
-
-
-
-
----
-
-Recuperar documento completo
-
-recovered = document_service.recover_document(session_id)
-
-Devuelve algo así:
-
-RecoveredDocument(
-    source_file_path="app/temp/abc123/estado.pdf",
-    recovered_file_path="app/temp/abc123/estado.pdf",
-    is_original=True
-)
-
-
----
-
-Recuperar rango de páginas
-
-recovered = document_service.recover_document(session_id, start_page=2, end_page=4)
-
-Devuelve algo así:
-
-RecoveredDocument(
-    source_file_path="app/temp/abc123/estado.pdf",
-    recovered_file_path="app/temp/abc123/chunks/pages_2_4.pdf",
-    start_page=2,
-    end_page=4,
-    is_original=False
-)
-
-
----
-
-Eliminar sesión y borrar disco
-
-document_service.delete_document_from_disk(session_id)
-
-Eso hace:
-
-1. busca la sesión
-
-
-2. borra temp/{session_id}
-
-
-3. elimina la sesión en memoria
+        return "\n\n".join(parts)
 
 
 
 
----
+class OCRService:
+    def run_ocr_on_page(self, input_path: str, page_number: int) -> str:
+        return f"[OCR] Texto simulado para la página {page_number} desde {input_path}"
 
-6) Cómo se vería tu API
 
-Si quieres exponerlo en FastAPI, sería algo así.
 
-from fastapi import APIRouter, UploadFile, File
-from app.services.storage_service import StorageService
-from app.services.session_manager import SessionManager
+
+
+
 from app.services.document_service import DocumentService
-
-router = APIRouter(prefix="/documents", tags=["documents"])
-
-storage_service = StorageService(temp_dir="app/temp")
-session_manager = SessionManager(ttl_minutes=120)
-document_service = DocumentService(storage_service, session_manager)
+from app.services.ocr_cache_service import OCRCacheService
 
 
-@router.post("/upload")
-async def upload_document(file: UploadFile = File(...)):
-    session = document_service.upload_document(file)
+class OCRPipelineService:
+    def __init__(
+        self,
+        document_service: DocumentService,
+        ocr_cache_service: OCRCacheService,
+        ocr_service,
+    ):
+        self.document_service = document_service
+        self.ocr_cache_service = ocr_cache_service
+        self.ocr_service = ocr_service
 
-    return {
-        "session_id": session.session_id,
-        "filename": session.filename,
-        "content_type": session.content_type,
-        "file_path": session.file_path,
-        "page_count": session.page_count,
-        "created_at": session.created_at,
-        "expires_at": session.expires_at,
-    }
+    def get_or_process_range(
+        self,
+        session_id: str,
+        start_page: int,
+        end_page: int,
+    ) -> dict:
+        missing_pages = self.ocr_cache_service.get_missing_pages(
+            session_id=session_id,
+            start_page=start_page,
+            end_page=end_page,
+        )
+
+        processed_pages = []
+
+        for page in missing_pages:
+            recovered = self.document_service.recover_document(
+                session_id=session_id,
+                start_page=page,
+                end_page=page,
+            )
+
+            text = self.ocr_service.run_ocr_on_page(
+                input_path=recovered.recovered_file_path,
+                page_number=page,
+            )
+
+            self.ocr_cache_service.add_page_result(
+                session_id=session_id,
+                page_number=page,
+                text=text,
+                source_path=recovered.recovered_file_path,
+            )
+
+            processed_pages.append(page)
+
+        full_text = self.ocr_cache_service.build_text_for_range(
+            session_id=session_id,
+            start_page=start_page,
+            end_page=end_page,
+        )
+
+        return {
+            "session_id": session_id,
+            "start_page": start_page,
+            "end_page": end_page,
+            "processed_pages": processed_pages,
+            "cached_pages_used": [
+                page for page in range(start_page, end_page + 1)
+                if page not in processed_pages
+            ],
+            "text": full_text,
+        }
 
 
-@router.get("/{session_id}/recover")
-async def recover_original_document(session_id: str):
-    recovered = document_service.recover_document(session_id)
-
-    return recovered.model_dump()
 
 
-@router.get("/{session_id}/recover-range")
-async def recover_document_range(session_id: str, start_page: int, end_page: int):
-    recovered = document_service.recover_document(
-        session_id=session_id,
-        start_page=start_page,
-        end_page=end_page,
+
+
+
+
+from pathlib import Path
+import webbrowser
+
+from app.services.session_manager import SessionManager
+from app.services.storage_service import StorageService
+from app.services.document_service import DocumentService
+from app.services.ocr_cache_service import OCRCacheService
+from app.services.ocr_service import OCRService
+from app.services.ocr_pipeline_service import OCRPipelineService
+
+
+class FakeUploadFile:
+    def __init__(self, filepath: str, content_type: str):
+        self.path = Path(filepath)
+        self.filename = self.path.name
+        self.content_type = content_type
+        self.file = open(self.path, "rb")
+
+    def close(self):
+        if self.file and not self.file.closed:
+            self.file.close()
+
+
+def detect_content_type(filepath: str) -> str:
+    suffix = Path(filepath).suffix.lower()
+    if suffix == ".pdf":
+        return "application/pdf"
+    if suffix == ".png":
+        return "image/png"
+    if suffix in [".jpg", ".jpeg"]:
+        return "image/jpeg"
+    raise ValueError(f"Tipo de archivo no soportado: {suffix}")
+
+
+def show_file(path: str) -> None:
+    file_path = Path(path).resolve()
+    print(f"\n[INFO] Abriendo archivo: {file_path}")
+    webbrowser.open(file_path.as_uri())
+
+
+def main():
+    sample_file = "sample_docs/ejemplo.pdf"
+
+    if not Path(sample_file).exists():
+        raise FileNotFoundError(
+            f"No existe el archivo de prueba: {sample_file}\n"
+            "Crea la carpeta sample_docs y coloca ahí un PDF o imagen."
+        )
+
+    session_manager = SessionManager(ttl_minutes=120)
+    storage_service = StorageService(temp_dir="app/temp")
+    document_service = DocumentService(storage_service, session_manager)
+    ocr_cache_service = OCRCacheService(session_manager)
+    ocr_service = OCRService()
+    ocr_pipeline = OCRPipelineService(
+        document_service=document_service,
+        ocr_cache_service=ocr_cache_service,
+        ocr_service=ocr_service,
     )
 
-    return recovered.model_dump()
+    upload = FakeUploadFile(
+        filepath=sample_file,
+        content_type=detect_content_type(sample_file),
+    )
+
+    try:
+        print("\n=== 1. SUBIR DOCUMENTO ===")
+        session = document_service.upload_document(upload)
+        print(f"session_id  : {session.session_id}")
+        print(f"file_path   : {session.file_path}")
+        print(f"session_dir : {session.session_dir}")
+        print(f"page_count  : {session.page_count}")
+
+        print("\n=== 2. RECUPERAR ORIGINAL ===")
+        recovered_original = document_service.recover_document(session.session_id)
+        print(recovered_original.model_dump())
+        if recovered_original.recovered_file_path.lower().endswith(".pdf"):
+            show_file(recovered_original.recovered_file_path)
+
+        if session.content_type == "application/pdf" and session.page_count and session.page_count >= 2:
+            print("\n=== 3. RECUPERAR RANGO 1-2 ===")
+            recovered_range = document_service.recover_document(
+                session_id=session.session_id,
+                start_page=1,
+                end_page=2,
+            )
+            print(recovered_range.model_dump())
+            show_file(recovered_range.recovered_file_path)
+
+            print("\n=== 4. OCR DEL RANGO 1-2 ===")
+            result_1 = ocr_pipeline.get_or_process_range(
+                session_id=session.session_id,
+                start_page=1,
+                end_page=2,
+            )
+            print(result_1)
+
+            print("\n=== 5. OCR DEL RANGO 2-3 (REUSA CACHE DE 2 SI EXISTE) ===")
+            end_page = min(3, session.page_count)
+            result_2 = ocr_pipeline.get_or_process_range(
+                session_id=session.session_id,
+                start_page=2,
+                end_page=end_page,
+            )
+            print(result_2)
+
+            print("\n=== 6. MOSTRAR CACHE EN MEMORIA ===")
+            current_session = session_manager.get_session(session.session_id)
+            print(current_session.ocr_cache.model_dump())
+
+            print("\n=== 7. MOSTRAR OCR_CACHE.JSON ===")
+            cache_file = Path(current_session.session_dir) / "ocr_cache.json"
+            print(f"cache_file: {cache_file}")
+            if cache_file.exists():
+                print(cache_file.read_text(encoding='utf-8'))
+
+        print("\n=== 8. ELIMINAR SESIÓN Y ARCHIVOS ===")
+        document_service.delete_document_from_disk(session.session_id)
+        print("Sesión y archivos eliminados.")
+
+    finally:
+        upload.close()
 
 
-@router.delete("/{session_id}")
-async def delete_document(session_id: str):
-    document_service.delete_document_from_disk(session_id)
-    return {"message": "Session and temp files deleted"}
+if __name__ == "__main__":
+    main()
 
-
----
-
-7) Cómo conecta esto con tu OCR
-
-Tu OCR ya no necesita “guardar binario en sesión”.
-
-Hace esto:
-
-recovered = document_service.recover_document(session_id, start_page=1, end_page=2)
-input_path = recovered.recovered_file_path
-
-# aquí llamas tu OCR
-text = ocr_service.run_ocr(input_path)
-
-Entonces:
-
-si quieres el original, OCR usa el original
-
-si quieres un rango, OCR usa el chunk temporal
-
-nunca modificas el PDF original
-
-
-
----
-
-8) Qué recomiendo finalmente para tu caso
-
-Yo dejaría así las responsabilidades:
-
-SessionManager
-
-Maneja:
-
-crear sesión
-
-obtener sesión
-
-eliminar sesión
-
-
-StorageService
-
-Maneja:
-
-crear carpetas
-
-guardar archivo
-
-borrar carpeta de sesión
-
-crear rutas de chunks
-
-
-DocumentService
-
-Coordina:
-
-subir documento
-
-recuperar documento completo
-
-recuperar rango
-
-borrar documento en disco + sesión
-
-
-
----
-
-9) Punto importante de diseño
-
-Aunque preguntaste por “crear sesión” y “subir documento” por separado, en tu caso práctico casi siempre van unidos.
-
-Porque una sesión vacía sin archivo no aporta mucho.
-
-Entonces tu flujo real más natural es:
-
-upload_document() → crea sesión + guarda archivo
-
-recover_document() → obtiene original o rango
-
-delete_document_from_disk() → borra carpeta + sesión
-
-
-Si quisieras, sí puedo darte la versión final completa de estos 3 archivos ya corregidos y pulidos, lista para copiar al proyecto, con nombres más limpios y preparada para luego meter OCR cache y render cache.
