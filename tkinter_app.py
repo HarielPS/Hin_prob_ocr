@@ -1,429 +1,595 @@
-# app/ui/tkinter_app.py
+Te lo dejo ya aterrizado a tu caso exacto: una API que maneja
 
-import json
-import sys
+crear sesión
+
+eliminar sesión
+
+subir documento
+
+recuperar documento
+
+borrar documento en disco
+
+
+con una carpeta temp/ y una sesión ligera en memoria.
+
+La idea es esta:
+
+la sesión guarda metadatos
+
+el documento vive en temp/{session_id}/
+
+recover_document toma el original desde disco
+
+si necesitas un rango de páginas, crea un chunk temporal
+
+al eliminar la sesión, borras memoria y carpeta temporal
+
+
+
+---
+
+Estructura recomendada
+
+app/
+├── main.py
+├── models/
+│   └── session_models.py
+├── services/
+│   ├── session_manager.py
+│   ├── storage_service.py
+│   └── document_service.py
+└── temp/
+
+
+---
+
+1) app/models/session_models.py
+
+Aquí defines la estructura de la sesión y de recuperación.
+
+from datetime import datetime
+from typing import Optional
+from pydantic import BaseModel, Field
+
+
+class SessionData(BaseModel):
+    session_id: str
+    filename: str
+    content_type: str
+    file_path: str
+    session_dir: str
+    created_at: datetime
+    expires_at: datetime
+    page_count: Optional[int] = None
+    chunks: list[str] = Field(default_factory=list)
+
+
+class RecoveredDocument(BaseModel):
+    source_file_path: str
+    recovered_file_path: str
+    start_page: Optional[int] = None
+    end_page: Optional[int] = None
+    is_original: bool = False
+
+
+---
+
+2) app/services/session_manager.py
+
+Esto solo maneja la sesión en memoria.
+
+from datetime import datetime, timedelta, timezone
+from uuid import uuid4
+from typing import Dict
+from fastapi import HTTPException
+
+from app.models.session_models import SessionData
+
+
+class SessionManager:
+    def __init__(self, ttl_minutes: int = 120):
+        self.ttl_minutes = ttl_minutes
+        self.sessions: Dict[str, SessionData] = {}
+
+    def create_session(
+        self,
+        filename: str,
+        content_type: str,
+        file_path: str,
+        session_dir: str,
+        page_count: int | None = None,
+    ) -> SessionData:
+        session_id = str(uuid4())
+        now = datetime.now(timezone.utc)
+        expires_at = now + timedelta(minutes=self.ttl_minutes)
+
+        session = SessionData(
+            session_id=session_id,
+            filename=filename,
+            content_type=content_type,
+            file_path=file_path,
+            session_dir=session_dir,
+            created_at=now,
+            expires_at=expires_at,
+            page_count=page_count,
+        )
+
+        self.sessions[session_id] = session
+        return session
+
+    def create_session_with_id(
+        self,
+        session_id: str,
+        filename: str,
+        content_type: str,
+        file_path: str,
+        session_dir: str,
+        page_count: int | None = None,
+    ) -> SessionData:
+        now = datetime.now(timezone.utc)
+        expires_at = now + timedelta(minutes=self.ttl_minutes)
+
+        session = SessionData(
+            session_id=session_id,
+            filename=filename,
+            content_type=content_type,
+            file_path=file_path,
+            session_dir=session_dir,
+            created_at=now,
+            expires_at=expires_at,
+            page_count=page_count,
+        )
+
+        self.sessions[session_id] = session
+        return session
+
+    def get_session(self, session_id: str) -> SessionData:
+        session = self.sessions.get(session_id)
+
+        if session is None:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        if datetime.now(timezone.utc) > session.expires_at:
+            self.sessions.pop(session_id, None)
+            raise HTTPException(status_code=410, detail="Session expired")
+
+        return session
+
+    def delete_session(self, session_id: str) -> None:
+        self.sessions.pop(session_id, None)
+
+
+---
+
+3) app/services/storage_service.py
+
+Este servicio maneja el disco.
+
+import shutil
 from pathlib import Path
-from dataclasses import dataclass
-from typing import Optional, List, Dict, Any, Tuple
-
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
-
-from PIL import Image, ImageTk
-from pdf2image import convert_from_path
-
-ROOT = Path(__file__).resolve().parents[2]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
-from app.rules.rule_generator import generate_rule_from_region
+from uuid import uuid4
+from fastapi import UploadFile, HTTPException
 
 
-DATA_DIR = Path("/home/harielpadillasanchez/Documentos/Empleo/Inbursa/OCR_document_inbursa/data")
-SUPPORTED_EXT = {".pdf", ".png", ".jpg", ".jpeg"}  # DOC/DOCX fuera por ahora
+class StorageService:
+    def __init__(self, temp_dir: str = "app/temp"):
+        self.temp_dir = Path(temp_dir)
+        self.temp_dir.mkdir(parents=True, exist_ok=True)
+
+    def create_session_dir(self, session_id: str) -> Path:
+        session_dir = self.temp_dir / session_id
+        session_dir.mkdir(parents=True, exist_ok=True)
+        return session_dir
+
+    def save_uploaded_file(self, session_id: str, upload_file: UploadFile) -> tuple[str, str]:
+        session_dir = self.create_session_dir(session_id)
+        file_path = session_dir / upload_file.filename
+
+        with file_path.open("wb") as buffer:
+            shutil.copyfileobj(upload_file.file, buffer)
+
+        return str(file_path), str(session_dir)
+
+    def delete_session_dir(self, session_id: str) -> None:
+        session_dir = self.temp_dir / session_id
+        if session_dir.exists():
+            shutil.rmtree(session_dir, ignore_errors=True)
+
+    def ensure_chunks_dir(self, session_id: str) -> Path:
+        chunks_dir = self.temp_dir / session_id / "chunks"
+        chunks_dir.mkdir(parents=True, exist_ok=True)
+        return chunks_dir
+
+    def build_chunk_path(self, session_id: str, start_page: int, end_page: int) -> Path:
+        chunks_dir = self.ensure_chunks_dir(session_id)
+        return chunks_dir / f"pages_{start_page}_{end_page}.pdf"
+
+    def delete_file(self, file_path: str) -> None:
+        path = Path(file_path)
+        if path.exists() and path.is_file():
+            path.unlink()
+
+    def validate_file_exists(self, file_path: str) -> Path:
+        path = Path(file_path)
+        if not path.exists():
+            raise HTTPException(status_code=404, detail="Document file not found on disk")
+        return path
 
 
-@dataclass
-class DocState:
-    file_path: Optional[Path] = None
-    doc_type: Optional[str] = None  # "pdf" | "image"
-    pages: Optional[List[Image.Image]] = None  # PIL images (original)
-    page_index: int = 0
-    zoom: float = 1.0
+---
+
+4) app/services/document_service.py
+
+Aquí está la lógica de documento: subir, recuperar original o rango, y borrar.
+
+Voy a usar pypdf para extraer páginas. Si no la tienes, sería:
+
+pip install pypdf
+
+from pathlib import Path
+from fastapi import UploadFile, HTTPException
+from pypdf import PdfReader, PdfWriter
+
+from app.models.session_models import RecoveredDocument
+from app.services.storage_service import StorageService
+from app.services.session_manager import SessionManager
 
 
-def list_data_files() -> List[Path]:
-    if not DATA_DIR.exists():
-        return []
-    return [
-        p for p in sorted(DATA_DIR.iterdir())
-        if p.is_file() and p.suffix.lower() in SUPPORTED_EXT
-    ]
+class DocumentService:
+    def __init__(self, storage_service: StorageService, session_manager: SessionManager):
+        self.storage_service = storage_service
+        self.session_manager = session_manager
+
+    def upload_document(self, upload_file: UploadFile):
+        if not upload_file.filename:
+            raise HTTPException(status_code=400, detail="Filename is required")
+
+        allowed_types = {
+            "application/pdf",
+            "image/png",
+            "image/jpeg",
+            "image/jpg",
+        }
+
+        if upload_file.content_type not in allowed_types:
+            raise HTTPException(status_code=400, detail="Unsupported file type")
+
+        from uuid import uuid4
+        session_id = str(uuid4())
+
+        file_path, session_dir = self.storage_service.save_uploaded_file(session_id, upload_file)
+
+        page_count = None
+        if upload_file.content_type == "application/pdf":
+            page_count = self._count_pdf_pages(file_path)
+        elif upload_file.content_type.startswith("image/"):
+            page_count = 1
+
+        session = self.session_manager.create_session_with_id(
+            session_id=session_id,
+            filename=upload_file.filename,
+            content_type=upload_file.content_type,
+            file_path=file_path,
+            session_dir=session_dir,
+            page_count=page_count,
+        )
+
+        return session
+
+    def recover_document(
+        self,
+        session_id: str,
+        start_page: int | None = None,
+        end_page: int | None = None,
+    ) -> RecoveredDocument:
+        session = self.session_manager.get_session(session_id)
+        original_path = self.storage_service.validate_file_exists(session.file_path)
+
+        # Si es imagen, solo regresa el original
+        if session.content_type.startswith("image/"):
+            return RecoveredDocument(
+                source_file_path=str(original_path),
+                recovered_file_path=str(original_path),
+                is_original=True,
+            )
+
+        # Si es PDF y no mandan rango, regresa el original
+        if start_page is None and end_page is None:
+            return RecoveredDocument(
+                source_file_path=str(original_path),
+                recovered_file_path=str(original_path),
+                is_original=True,
+            )
+
+        if start_page is None or end_page is None:
+            raise HTTPException(status_code=400, detail="start_page and end_page must both be provided")
+
+        if start_page < 1 or end_page < 1:
+            raise HTTPException(status_code=400, detail="Pages must be >= 1")
+
+        if start_page > end_page:
+            raise HTTPException(status_code=400, detail="start_page cannot be greater than end_page")
+
+        if session.page_count is not None and end_page > session.page_count:
+            raise HTTPException(status_code=400, detail="Requested range exceeds document page count")
+
+        chunk_path = self.storage_service.build_chunk_path(session_id, start_page, end_page)
+
+        # Si ya existe el chunk, lo reutilizamos
+        if chunk_path.exists():
+            return RecoveredDocument(
+                source_file_path=str(original_path),
+                recovered_file_path=str(chunk_path),
+                start_page=start_page,
+                end_page=end_page,
+                is_original=False,
+            )
+
+        self._extract_pdf_range(
+            source_pdf_path=str(original_path),
+            output_pdf_path=str(chunk_path),
+            start_page=start_page,
+            end_page=end_page,
+        )
+
+        session.chunks.append(str(chunk_path))
+
+        return RecoveredDocument(
+            source_file_path=str(original_path),
+            recovered_file_path=str(chunk_path),
+            start_page=start_page,
+            end_page=end_page,
+            is_original=False,
+        )
+
+    def delete_document_from_disk(self, session_id: str) -> None:
+        session = self.session_manager.get_session(session_id)
+        self.storage_service.delete_session_dir(session_id)
+        self.session_manager.delete_session(session_id)
+
+    def _count_pdf_pages(self, file_path: str) -> int:
+        reader = PdfReader(file_path)
+        return len(reader.pages)
+
+    def _extract_pdf_range(
+        self,
+        source_pdf_path: str,
+        output_pdf_path: str,
+        start_page: int,
+        end_page: int,
+    ) -> None:
+        reader = PdfReader(source_pdf_path)
+        writer = PdfWriter()
+
+        # pypdf usa índice base 0
+        for page_index in range(start_page - 1, end_page):
+            writer.add_page(reader.pages[page_index])
+
+        with open(output_pdf_path, "wb") as output_file:
+            writer.write(output_file)
 
 
-def build_region_payload(file_path: str, page_index: int, bbox: dict, mode: str = "auto") -> dict:
-    """
-    Hook para tu lógica inteligente. MVP: region_only.
-    """
+---
+
+5) Cómo se usan estas funciones
+
+Crear sesión + subir documento
+
+En realidad en tu flujo se crean juntas cuando subes el archivo.
+
+session = document_service.upload_document(upload_file)
+
+Eso hace:
+
+1. genera session_id
+
+
+2. crea carpeta temp/{session_id}
+
+
+3. guarda archivo
+
+
+4. crea sesión en memoria
+
+
+5. devuelve SessionData
+
+
+
+
+---
+
+Recuperar documento completo
+
+recovered = document_service.recover_document(session_id)
+
+Devuelve algo así:
+
+RecoveredDocument(
+    source_file_path="app/temp/abc123/estado.pdf",
+    recovered_file_path="app/temp/abc123/estado.pdf",
+    is_original=True
+)
+
+
+---
+
+Recuperar rango de páginas
+
+recovered = document_service.recover_document(session_id, start_page=2, end_page=4)
+
+Devuelve algo así:
+
+RecoveredDocument(
+    source_file_path="app/temp/abc123/estado.pdf",
+    recovered_file_path="app/temp/abc123/chunks/pages_2_4.pdf",
+    start_page=2,
+    end_page=4,
+    is_original=False
+)
+
+
+---
+
+Eliminar sesión y borrar disco
+
+document_service.delete_document_from_disk(session_id)
+
+Eso hace:
+
+1. busca la sesión
+
+
+2. borra temp/{session_id}
+
+
+3. elimina la sesión en memoria
+
+
+
+
+---
+
+6) Cómo se vería tu API
+
+Si quieres exponerlo en FastAPI, sería algo así.
+
+from fastapi import APIRouter, UploadFile, File
+from app.services.storage_service import StorageService
+from app.services.session_manager import SessionManager
+from app.services.document_service import DocumentService
+
+router = APIRouter(prefix="/documents", tags=["documents"])
+
+storage_service = StorageService(temp_dir="app/temp")
+session_manager = SessionManager(ttl_minutes=120)
+document_service = DocumentService(storage_service, session_manager)
+
+
+@router.post("/upload")
+async def upload_document(file: UploadFile = File(...)):
+    session = document_service.upload_document(file)
+
     return {
-        "file_path": file_path,
-        "page_index": page_index,
-        "bbox": bbox,
-        "strategy": "region_only",
-        "extra_pages": [],
-        "mode": mode,
+        "session_id": session.session_id,
+        "filename": session.filename,
+        "content_type": session.content_type,
+        "file_path": session.file_path,
+        "page_count": session.page_count,
+        "created_at": session.created_at,
+        "expires_at": session.expires_at,
     }
 
 
-class OCRRuleTkApp(tk.Tk):
-    def __init__(self):
-        super().__init__()
-        self.title("OCR + LLM Rules (Tkinter MVP)")
-        self.geometry("1200x800")
+@router.get("/{session_id}/recover")
+async def recover_original_document(session_id: str):
+    recovered = document_service.recover_document(session_id)
 
-        self.state_ = DocState()
-        self.rules: List[Dict[str, Any]] = []
+    return recovered.model_dump()
 
-        # selección actual (coords en canvas)
-        self._drag_start: Optional[Tuple[int, int]] = None
-        self._rect_id: Optional[int] = None
-        self._last_bbox_img: Optional[dict] = None  # coords en imagen original
-
-        self._photo: Optional[ImageTk.PhotoImage] = None  # referencia para Tkinter
-
-        self._build_ui()
-        self._load_file_list()
-
-        self.protocol("WM_DELETE_WINDOW", self.on_close)
-
-    # ---------------- UI ----------------
-    def _build_ui(self):
-        # Top bar
-        top = ttk.Frame(self)
-        top.pack(side=tk.TOP, fill=tk.X, padx=8, pady=6)
-
-        ttk.Button(top, text="Abrir archivo...", command=self.open_file_dialog).pack(side=tk.LEFT)
-        ttk.Label(top, text="   o elegir en /data:").pack(side=tk.LEFT)
-
-        self.file_combo = ttk.Combobox(top, state="readonly", width=60)
-        self.file_combo.pack(side=tk.LEFT, padx=6)
-        self.file_combo.bind("<<ComboboxSelected>>", self.on_pick_data_file)
-
-        ttk.Separator(self, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=4)
-
-        # Controls
-        controls = ttk.Frame(self)
-        controls.pack(side=tk.TOP, fill=tk.X, padx=8)
-
-        self.btn_prev = ttk.Button(controls, text="◀ Prev", command=self.prev_page, state=tk.DISABLED)
-        self.btn_prev.pack(side=tk.LEFT)
-
-        self.page_label = ttk.Label(controls, text="Página: -/-")
-        self.page_label.pack(side=tk.LEFT, padx=10)
-
-        self.btn_next = ttk.Button(controls, text="Next ▶", command=self.next_page, state=tk.DISABLED)
-        self.btn_next.pack(side=tk.LEFT)
-
-        ttk.Label(controls, text="   Zoom:").pack(side=tk.LEFT, padx=(20, 4))
-        self.zoom_var = tk.DoubleVar(value=1.0)
-        self.zoom_slider = ttk.Scale(controls, from_=0.5, to=2.0, value=1.0, command=self.on_zoom_change)
-        self.zoom_slider.pack(side=tk.LEFT, fill=tk.X, expand=True)
-
-        ttk.Button(controls, text="Reset selección", command=self.reset_selection).pack(side=tk.LEFT, padx=10)
-
-        # Field title + actions
-        actions = ttk.Frame(self)
-        actions.pack(side=tk.TOP, fill=tk.X, padx=8, pady=6)
-
-        ttk.Label(actions, text="Título del campo:").pack(side=tk.LEFT)
-        self.field_title_var = tk.StringVar(value="numero_cuenta")
-        ttk.Entry(actions, textvariable=self.field_title_var, width=30).pack(side=tk.LEFT, padx=6)
-
-        ttk.Button(actions, text="Generar regla (LLM)", command=self.generate_rule).pack(side=tk.LEFT, padx=10)
-
-        self.status_var = tk.StringVar(value="Listo. Abre un archivo para comenzar.")
-        ttk.Label(actions, textvariable=self.status_var).pack(side=tk.LEFT, padx=10)
-
-        ttk.Separator(self, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=4)
-
-        # Main canvas (with scroll)
-        main = ttk.Frame(self)
-        main.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
-
-        self.canvas = tk.Canvas(main, bg="#222222", highlightthickness=0)
-        self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
-        yscroll = ttk.Scrollbar(main, orient=tk.VERTICAL, command=self.canvas.yview)
-        yscroll.pack(side=tk.RIGHT, fill=tk.Y)
-        self.canvas.configure(yscrollcommand=yscroll.set)
-
-        # Bind mouse for rectangle selection
-        self.canvas.bind("<ButtonPress-1>", self.on_mouse_down)
-        self.canvas.bind("<B1-Motion>", self.on_mouse_drag)
-        self.canvas.bind("<ButtonRelease-1>", self.on_mouse_up)
-
-        # Bottom info
-        bottom = ttk.Frame(self)
-        bottom.pack(side=tk.BOTTOM, fill=tk.X, padx=8, pady=6)
-        self.bbox_label = ttk.Label(bottom, text="BBox: (sin selección)")
-        self.bbox_label.pack(side=tk.LEFT)
-
-        self.rules_label = ttk.Label(bottom, text="Reglas en memoria: 0")
-        self.rules_label.pack(side=tk.RIGHT)
-
-    def _load_file_list(self):
-        files = list_data_files()
-        self._data_files = files
-        labels = [f.name for f in files]
-        self.file_combo["values"] = labels
-        if labels:
-            self.file_combo.set(labels[0])
-
-    # ---------------- File handling ----------------
-    def open_file_dialog(self):
-        path = filedialog.askopenfilename(
-            title="Selecciona un documento",
-            filetypes=[
-                ("PDF", "*.pdf"),
-                ("Images", "*.png *.jpg *.jpeg"),
-                ("All", "*.*"),
-            ],
-        )
-        if not path:
-            return
-        self.load_document(Path(path))
-
-    def on_pick_data_file(self, _evt=None):
-        name = self.file_combo.get()
-        if not name:
-            return
-        p = DATA_DIR / name
-        self.load_document(p)
-
-    def load_document(self, path: Path):
-        if not path.exists():
-            messagebox.showerror("Error", f"No existe: {path}")
-            return
-
-        ext = path.suffix.lower()
-        self.reset_selection()
-
-        try:
-            if ext == ".pdf":
-                self.status_var.set("Cargando PDF (renderizando páginas)...")
-                self.update_idletasks()
-                pages = convert_from_path(str(path), dpi=160)
-                self.state_ = DocState(file_path=path, doc_type="pdf", pages=pages, page_index=0, zoom=1.0)
-                self.zoom_var.set(1.0)
-                self.zoom_slider.set(1.0)
-            elif ext in {".png", ".jpg", ".jpeg"}:
-                img = Image.open(path).convert("RGB")
-                self.state_ = DocState(file_path=path, doc_type="image", pages=[img], page_index=0, zoom=1.0)
-                self.zoom_var.set(1.0)
-                self.zoom_slider.set(1.0)
-            else:
-                messagebox.showwarning("No soportado", f"Formato no soportado: {ext}")
-                return
-
-            self.status_var.set(f"Cargado: {path.name}")
-            self._refresh_page_controls()
-            self.render_current_page()
-
-        except Exception as e:
-            messagebox.showerror("Error", str(e))
-            self.status_var.set("Error al cargar documento.")
-
-    def _refresh_page_controls(self):
-        pages = self.state_.pages or []
-        total = len(pages)
-
-        if total > 1:
-            self.btn_prev.config(state=tk.NORMAL)
-            self.btn_next.config(state=tk.NORMAL)
-        else:
-            self.btn_prev.config(state=tk.DISABLED)
-            self.btn_next.config(state=tk.DISABLED)
-
-        self.page_label.config(text=f"Página: {self.state_.page_index + 1}/{max(1, total)}")
-
-    def prev_page(self):
-        if not self.state_.pages:
-            return
-        if self.state_.page_index > 0:
-            self.state_.page_index -= 1
-            self.reset_selection()
-            self._refresh_page_controls()
-            self.render_current_page()
-
-    def next_page(self):
-        if not self.state_.pages:
-            return
-        if self.state_.page_index < len(self.state_.pages) - 1:
-            self.state_.page_index += 1
-            self.reset_selection()
-            self._refresh_page_controls()
-            self.render_current_page()
-
-    def on_zoom_change(self, _val):
-        self.state_.zoom = float(self.zoom_slider.get())
-        self.render_current_page()
-
-    # ---------------- Rendering ----------------
-    def render_current_page(self):
-        if not self.state_.pages:
-            return
-
-        img = self.state_.pages[self.state_.page_index]
-        zoom = self.state_.zoom
-
-        w, h = img.size
-        zw, zh = int(w * zoom), int(h * zoom)
-
-        rendered = img.resize((zw, zh))
-
-        self._photo = ImageTk.PhotoImage(rendered)
-        self.canvas.delete("all")
-
-        # Put image at 0,0 anchored nw
-        self.canvas.create_image(0, 0, image=self._photo, anchor="nw", tags=("page_image",))
-
-        # update scroll region
-        self.canvas.configure(scrollregion=(0, 0, zw, zh))
-
-        self._refresh_page_controls()
-        self._update_bbox_label()
-
-    # ---------------- Selection (rectangle) ----------------
-    def on_mouse_down(self, event):
-        if not self.state_.pages:
-            return
-        self.reset_selection(keep_bbox=False)
-        self._drag_start = (self.canvas.canvasx(event.x), self.canvas.canvasy(event.y))
-        x, y = self._drag_start
-        self._rect_id = self.canvas.create_rectangle(x, y, x, y, outline="red", width=2)
-
-    def on_mouse_drag(self, event):
-        if self._drag_start is None or self._rect_id is None:
-            return
-        x0, y0 = self._drag_start
-        x1, y1 = (self.canvas.canvasx(event.x), self.canvas.canvasy(event.y))
-        self.canvas.coords(self._rect_id, x0, y0, x1, y1)
-
-    def on_mouse_up(self, event):
-        if self._drag_start is None or self._rect_id is None:
-            return
-
-        x0, y0 = self._drag_start
-        x1, y1 = (self.canvas.canvasx(event.x), self.canvas.canvasy(event.y))
-
-        # normalize
-        rx1, ry1 = min(x0, x1), min(y0, y1)
-        rx2, ry2 = max(x0, x1), max(y0, y1)
-
-        # convert from rendered coords -> original img coords
-        img = self.state_.pages[self.state_.page_index]
-        img_w, img_h = img.size
-        zoom = self.state_.zoom
-
-        ox1 = int(rx1 / zoom)
-        oy1 = int(ry1 / zoom)
-        ox2 = int(rx2 / zoom)
-        oy2 = int(ry2 / zoom)
-
-        # clamp
-        ox1 = max(0, min(img_w - 1, ox1))
-        oy1 = max(0, min(img_h - 1, oy1))
-        ox2 = max(0, min(img_w, ox2))
-        oy2 = max(0, min(img_h, oy2))
-
-        # validate bbox size
-        if abs(ox2 - ox1) < 2 or abs(oy2 - oy1) < 2:
-            self._last_bbox_img = None
-            self.status_var.set("Selección muy pequeña. Intenta de nuevo.")
-        else:
-            self._last_bbox_img = {"x1": ox1, "y1": oy1, "x2": ox2, "y2": oy2}
-            self.status_var.set("Selección lista. Ahora genera regla.")
-
-        self._drag_start = None
-        self._update_bbox_label()
-
-    def reset_selection(self, keep_bbox: bool = False):
-        if self._rect_id is not None:
-            try:
-                self.canvas.delete(self._rect_id)
-            except Exception:
-                pass
-        self._rect_id = None
-        self._drag_start = None
-        if not keep_bbox:
-            self._last_bbox_img = None
-        self._update_bbox_label()
-
-    def _update_bbox_label(self):
-        if self._last_bbox_img is None:
-            self.bbox_label.config(text="BBox: (sin selección)")
-        else:
-            self.bbox_label.config(text=f"BBox: {self._last_bbox_img}")
-
-    # ---------------- Rule generation ----------------
-    def generate_rule(self):
-        if self.state_.file_path is None or not self.state_.pages:
-            messagebox.showwarning("Falta documento", "Carga un documento primero.")
-            return
-
-        if self._last_bbox_img is None:
-            messagebox.showwarning("Falta selección", "Selecciona un área con el mouse (rectángulo).")
-            return
-
-        field_title = self.field_title_var.get().strip()
-        if not field_title:
-            messagebox.showwarning("Falta título", "Escribe el título del campo.")
-            return
-
-        file_path = str(self.state_.file_path)
-        page_index = int(self.state_.page_index)
-        bbox = dict(self._last_bbox_img)
-
-        # 1) payload inteligente
-        region_payload = build_region_payload(
-            file_path=file_path,
-            page_index=page_index,
-            bbox=bbox,
-            mode="auto",
-        )
-
-        # 2) OCR placeholder (se conecta después)
-        ocr_text = "[OCR_PENDING] Aún no está conectado el OCR. Solo bbox/payload."
-
-        # 3) LLM
-        try:
-            rule = generate_rule_from_region(
-                region=region_payload,
-                ocr_text=ocr_text,
-                field_title=field_title,
-            )
-
-            print("=== Regla generada ===")
-            print(json.dumps(rule, ensure_ascii=False, indent=2))
-
-            self.rules.append(
-                {
-                    "file": file_path,
-                    "page_index": page_index,
-                    "bbox": bbox,
-                    "field_title": field_title,
-                    "region_payload": region_payload,
-                    "rule": rule,
-                }
-            )
-            self.rules_label.config(text=f"Reglas en memoria: {len(self.rules)}")
-            self.status_var.set(f"Regla #{len(self.rules)} generada (ver consola).")
-
-        except Exception as e:
-            messagebox.showerror("Error LLM", str(e))
-            self.status_var.set("Error al generar regla.")
-
-    # ---------------- Close / save ----------------
-    def on_close(self):
-        """
-        Al cerrar:
-        - guarda rules_output.json si hay reglas
-        """
-        if self.rules:
-            out_path = ROOT / "rules_output.json"
-            try:
-                out_path.write_text(json.dumps(self.rules, ensure_ascii=False, indent=2), encoding="utf-8")
-                print(f"[INFO] Guardado: {out_path}")
-            except Exception as e:
-                messagebox.showerror("Error guardando JSON", str(e))
-
-        self.destroy()
-
-
-def main():
-    app = OCRRuleTkApp()
-    app.mainloop()
-
-
-if __name__ == "__main__":
-    main()
+
+@router.get("/{session_id}/recover-range")
+async def recover_document_range(session_id: str, start_page: int, end_page: int):
+    recovered = document_service.recover_document(
+        session_id=session_id,
+        start_page=start_page,
+        end_page=end_page,
+    )
+
+    return recovered.model_dump()
+
+
+@router.delete("/{session_id}")
+async def delete_document(session_id: str):
+    document_service.delete_document_from_disk(session_id)
+    return {"message": "Session and temp files deleted"}
+
+
+---
+
+7) Cómo conecta esto con tu OCR
+
+Tu OCR ya no necesita “guardar binario en sesión”.
+
+Hace esto:
+
+recovered = document_service.recover_document(session_id, start_page=1, end_page=2)
+input_path = recovered.recovered_file_path
+
+# aquí llamas tu OCR
+text = ocr_service.run_ocr(input_path)
+
+Entonces:
+
+si quieres el original, OCR usa el original
+
+si quieres un rango, OCR usa el chunk temporal
+
+nunca modificas el PDF original
+
+
+
+---
+
+8) Qué recomiendo finalmente para tu caso
+
+Yo dejaría así las responsabilidades:
+
+SessionManager
+
+Maneja:
+
+crear sesión
+
+obtener sesión
+
+eliminar sesión
+
+
+StorageService
+
+Maneja:
+
+crear carpetas
+
+guardar archivo
+
+borrar carpeta de sesión
+
+crear rutas de chunks
+
+
+DocumentService
+
+Coordina:
+
+subir documento
+
+recuperar documento completo
+
+recuperar rango
+
+borrar documento en disco + sesión
+
+
+
+---
+
+9) Punto importante de diseño
+
+Aunque preguntaste por “crear sesión” y “subir documento” por separado, en tu caso práctico casi siempre van unidos.
+
+Porque una sesión vacía sin archivo no aporta mucho.
+
+Entonces tu flujo real más natural es:
+
+upload_document() → crea sesión + guarda archivo
+
+recover_document() → obtiene original o rango
+
+delete_document_from_disk() → borra carpeta + sesión
+
+
+Si quisieras, sí puedo darte la versión final completa de estos 3 archivos ya corregidos y pulidos, lista para copiar al proyecto, con nombres más limpios y preparada para luego meter OCR cache y render cache.
